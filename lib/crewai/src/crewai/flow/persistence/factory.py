@@ -11,7 +11,8 @@ remote service, an in-memory fake for tests -- without passing a
 This mirrors :func:`crewai_core.lock_store.set_lock_backend`: a one-time,
 process-wide setter intended for application startup. Pass ``None`` to restore
 the built-in SQLite default. Call :func:`default_flow_persistence` to build the
-default backend (the registered factory if any, else SQLite).
+default backend (the registered factory if any, else GaussDB when
+``CREWAI_STORAGE_BACKEND=gaussdb``, else SQLite).
 """
 
 from __future__ import annotations
@@ -50,10 +51,21 @@ def default_flow_persistence() -> FlowPersistence:
 
     Returns the result of the registered factory if one is set, otherwise a
     built-in :class:`~crewai.flow.persistence.sqlite.SQLiteFlowPersistence`.
+
+    When ``CREWAI_STORAGE_BACKEND=gaussdb`` is set and no factory is
+    registered, the built-in :class:`~crewai.flow.persistence.gaussdb.GaussDBFlowPersistence`
+    is returned instead of the SQLite default.
     """
     factory = _factory
     if factory is not None:
         return factory()
+
+    from crewai.gaussdb.config import is_gaussdb_backend
+
+    if is_gaussdb_backend():
+        from crewai.flow.persistence.gaussdb import GaussDBFlowPersistence
+
+        return GaussDBFlowPersistence()
 
     from crewai.flow.persistence.sqlite import SQLiteFlowPersistence
 
