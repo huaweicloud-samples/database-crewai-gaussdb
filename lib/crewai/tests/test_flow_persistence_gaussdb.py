@@ -70,12 +70,51 @@ class TestGaussDBFlowPersistenceSQL:
         ctx.method_name = "ask"
         ctx.to_dict.return_value = {"method": "ask"}
         inst.save_pending_feedback("f-1", ctx, {"a": 1})
-        sqls = [sql for sql, _ in executed]
-        assert any("MERGE INTO pending_feedback" in sql for sql in sqls)
-        assert not any("ON CONFLICT" in sql for sql in sqls)
-        merge = next(sql for sql in sqls if "MERGE INTO pending_feedback" in sql)
-        assert "WHEN MATCHED THEN UPDATE" in merge
-        assert "WHEN NOT MATCHED THEN INSERT" in merge
+        # 两语句（INSERT flow_states + MERGE pending_feedback）同事务
+        assert len(executed) == 2
+        insert_sql, insert_params = executed[0]
+        assert "INSERT INTO flow_states" in insert_sql
+        assert insert_params[0] == "f-1"
+        assert insert_params[1] == "ask"
+        assert json.loads(insert_params[3]) == {"a": 1}
+        merge_sql, merge_params = executed[1]
+        assert "MERGE INTO pending_feedback" in merge_sql
+        assert "ON CONFLICT" not in merge_sql
+        assert "WHEN MATCHED THEN UPDATE" in merge_sql
+        assert "WHEN NOT MATCHED THEN INSERT" in merge_sql
+        # MERGE 参数顺序：flow_uuid, context_json, state_json, created_at
+        assert merge_params[0] == "f-1"
+        assert json.loads(merge_params[1]) == {"method": "ask"}
+        assert json.loads(merge_params[2]) == {"a": 1}
+
+    def test_clear_pending_feedback(self, monkeypatch) -> None:
+        inst, executed, _ = _make(monkeypatch)
+        inst.clear_pending_feedback("f-1")
+        sql, params = executed[0]
+        assert "DELETE FROM pending_feedback" in sql
+        assert params == ("f-1",)
+
+    def test_load_pending_feedback_parses_row(self, monkeypatch) -> None:
+        import json as json_mod
+        from crewai.flow.persistence import gaussdb as g
+
+        ctx_dict = {
+            "flow_id": "f-1", "flow_class": "tests.TinyFlow",
+            "method_name": "ask", "method_output": {"t": 1}, "message": "m",
+        }
+        _executed, fake = _install_fake_cursor(monkeypatch)
+        fake.fetchone.return_value = (
+            json_mod.dumps({"a": 1}), json_mod.dumps(ctx_dict),
+        )
+        inst = g.GaussDBFlowPersistence.model_construct(
+            persistence_type="GaussDBFlowPersistence",
+            config=g.GaussDBConfig.from_env(),
+        )
+        loaded = inst.load_pending_feedback("f-1")
+        assert loaded is not None
+        state, ctx = loaded
+        assert state == {"a": 1}
+        assert ctx.method_name == "ask"
 
     def test_load_state_selects_latest(self, monkeypatch) -> None:
         from crewai.flow.persistence import gaussdb as g

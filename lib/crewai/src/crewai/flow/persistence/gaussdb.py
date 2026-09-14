@@ -16,6 +16,8 @@ from crewai.gaussdb.connection import cursor
 
 
 if TYPE_CHECKING:
+    import psycopg2.extensions
+
     from crewai.flow.async_feedback.types import PendingFeedbackContext
 
 
@@ -68,7 +70,11 @@ _CLEAR_PENDING_SQL = "DELETE FROM pending_feedback WHERE flow_uuid = %s"
 
 
 def _to_state_dict(state_data: dict[str, Any] | Any) -> dict[str, Any]:
-    """Convert state_data to a plain dict (same contract as the SQLite backend)."""
+    """Convert state_data to a plain dict.
+
+    Accepts dicts and any object exposing ``model_dump()`` (a superset of the
+    SQLite backend's dict/BaseModel contract).
+    """
     if isinstance(state_data, dict):
         return state_data
     dump = getattr(state_data, "model_dump", None)
@@ -78,6 +84,24 @@ def _to_state_dict(state_data: dict[str, Any] | Any) -> dict[str, Any]:
     raise ValueError(
         "state_data must be either a Pydantic BaseModel or dict, "
         f"got {type(state_data)}"
+    )
+
+
+def _save_state_sql(
+    cur: psycopg2.extensions.cursor,
+    flow_uuid: str,
+    method_name: str,
+    state_dict: dict[str, Any],
+) -> None:
+    """Execute the save-state INSERT without acquiring the lock."""
+    cur.execute(
+        _INSERT_STATE_SQL,
+        (
+            flow_uuid,
+            method_name,
+            datetime.now(timezone.utc).isoformat(),
+            json.dumps(state_dict),
+        ),
     )
 
 
@@ -125,15 +149,7 @@ class GaussDBFlowPersistence(FlowPersistence):
         """
         state_dict = _to_state_dict(state_data)
         with store_lock(self._lock_name), cursor(self.config) as cur:
-            cur.execute(
-                _INSERT_STATE_SQL,
-                (
-                    flow_uuid,
-                    method_name,
-                    datetime.now(timezone.utc).isoformat(),
-                    json.dumps(state_dict),
-                ),
-            )
+            _save_state_sql(cur, flow_uuid, method_name, state_dict)
 
     def load_state(self, flow_uuid: str) -> dict[str, Any] | None:
         """Load the most recent state for a given flow UUID.
@@ -170,15 +186,7 @@ class GaussDBFlowPersistence(FlowPersistence):
         """
         state_dict = _to_state_dict(state_data)
         with store_lock(self._lock_name), cursor(self.config) as cur:
-            cur.execute(
-                _INSERT_STATE_SQL,
-                (
-                    flow_uuid,
-                    context.method_name,
-                    datetime.now(timezone.utc).isoformat(),
-                    json.dumps(state_dict),
-                ),
-            )
+            _save_state_sql(cur, flow_uuid, context.method_name, state_dict)
             cur.execute(
                 _SAVE_PENDING_SQL,
                 (
