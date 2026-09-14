@@ -1241,7 +1241,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             flow_id: The unique identifier of the paused flow (from state.id)
             persistence: The persistence backend where the state was saved.
                 If not provided, uses ``default_flow_persistence()`` (the
-                registered factory when present, else the built-in SQLite
+                registered factory when present, else GaussDB when
+                ``CREWAI_STORAGE_BACKEND=gaussdb``, else the built-in SQLite
                 fallback).
             definition: The FlowDefinition to restore a definition-built flow
                 (one created via ``Flow.from_declaration``) from. Subclasses

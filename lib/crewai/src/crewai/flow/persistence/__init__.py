@@ -4,14 +4,21 @@ CrewAI Flow Persistence.
 This module provides interfaces and implementations for persisting flow states.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from crewai.flow.persistence.base import FlowPersistence
 from crewai.flow.persistence.decorators import persist
 from crewai.flow.persistence.sqlite import SQLiteFlowPersistence
 
 
+if TYPE_CHECKING:
+    from crewai.flow.persistence.gaussdb import (
+        GaussDBFlowPersistence as GaussDBFlowPersistence,
+    )
+
+
 __all__ = ["FlowPersistence", "SQLiteFlowPersistence", "persist"]
+# GaussDBFlowPersistence intentionally absent from __all__: import * must not require psycopg2.
 
 
 def __getattr__(name: str) -> Any:

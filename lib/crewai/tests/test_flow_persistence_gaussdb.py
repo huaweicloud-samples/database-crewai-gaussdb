@@ -6,6 +6,7 @@ import contextlib
 import gc
 import json
 import os
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -236,18 +237,23 @@ class TestDefaultFactory:
         assert factory_mod.default_flow_persistence() is sentinel
 
     def test_default_flow_persistence_sqlite_by_default(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         import crewai.flow.persistence.factory as factory_mod
         from crewai.flow.persistence.sqlite import SQLiteFlowPersistence
 
+        # Land flow_states.db in this test's tmp_path instead of the shared
+        # user storage dir so cleanup never collides with other state.
+        monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path))
         monkeypatch.delenv("CREWAI_STORAGE_BACKEND", raising=False)
         monkeypatch.setattr(factory_mod, "_factory", None)
         backend = factory_mod.default_flow_persistence()
         assert isinstance(backend, SQLiteFlowPersistence)
         # The per-call SQLite connections land in reference cycles (cursor ->
         # connection), keeping flow_states.db locked on Windows; a GC pass
-        # closes them so the temp CREWAI_STORAGE_DIR can be removed in teardown.
+        # closes them so tmp_path can be removed later in the session.
         gc.collect()
 
     def test_lazy_export_gaussdb_flow_persistence(self) -> None:

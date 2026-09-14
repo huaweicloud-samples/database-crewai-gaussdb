@@ -161,7 +161,8 @@ def persist(
     Args:
         persistence: Optional FlowPersistence implementation to use.
                     If not provided, uses ``default_flow_persistence()`` (the
-                    registered factory when present, else the built-in SQLite
+                    registered factory when present, else GaussDB when
+                    ``CREWAI_STORAGE_BACKEND=gaussdb``, else the built-in SQLite
                     fallback).
         verbose: Whether to log persistence operations. Defaults to False.
 
