@@ -16,14 +16,16 @@ class TestGaussDBConfig:
         monkeypatch.setenv("GAUSSDB_USER", "u1")
         monkeypatch.setenv("GAUSSDB_PASSWORD", "p1")
         monkeypatch.setenv("GAUSSDB_DATABASE", "db1")
+        monkeypatch.setenv("GAUSSDB_MIN_CONNECTIONS", "3")
+        monkeypatch.setenv("GAUSSDB_MAX_CONNECTIONS", "30")
         cfg = GaussDBConfig.from_env()
         assert cfg.host == "10.0.0.1"
         assert cfg.port == 19995
         assert cfg.user == "u1"
         assert cfg.password == "p1"
         assert cfg.database == "db1"
-        assert cfg.min_connections == 1
-        assert cfg.max_connections == 10
+        assert cfg.min_connections == 3
+        assert cfg.max_connections == 30
 
     def test_from_env_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for var in (
@@ -61,10 +63,11 @@ class TestPool:
         class FakePool:
             def __init__(self, tag: str) -> None:
                 self.tag = tag
+                self.closed = False
                 created.append(tag)
 
             def closeall(self) -> None:
-                pass
+                self.closed = True
 
         monkeypatch.setattr(
             "crewai.gaussdb.connection._create_pool_instance",
@@ -79,11 +82,82 @@ class TestPool:
         cfg_b = GaussDBConfig(database="db_b")
         pool3 = conn_mod.get_pool(cfg_b)
         assert pool3 is not pool1
+        assert pool1.closed is True  # 重建时关闭旧池
 
         conn_mod.reset_pool()
         pool4 = conn_mod.get_pool(cfg_b)
         assert pool4 is not pool3
         assert len(created) == 3
+
+
+class TestConnectionContext:
+    def _patch_pool(self, monkeypatch: pytest.MonkeyPatch):
+        import crewai.gaussdb.connection as conn_mod
+        from crewai.gaussdb.config import GaussDBConfig
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.committed = False
+                self.rolled_back = False
+                self.put_back = False
+
+            def commit(self) -> None:
+                self.committed = True
+
+            def rollback(self) -> None:
+                self.rolled_back = True
+
+        class FakePool2:
+            def __init__(self) -> None:
+                self.conns = [FakeConn()]
+                self.closed = False
+
+            def getconn(self):
+                return self.conns.pop(0)
+
+            def putconn(self, conn):
+                conn.put_back = True
+
+            def closeall(self) -> None:
+                self.closed = True
+
+        pool = FakePool2()
+        monkeypatch.setattr(
+            conn_mod, "_create_pool_instance", lambda cfg, minc, maxc: pool
+        )
+        return conn_mod, pool
+
+    def test_commit_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        conn_mod, pool = self._patch_pool(monkeypatch)
+        from crewai.gaussdb.config import GaussDBConfig
+        from crewai.gaussdb.connection import connection
+
+        with connection(GaussDBConfig(database="db_x")) as conn:
+            pass
+        assert conn.committed is True
+        assert conn.rolled_back is False
+        assert conn.put_back is True
+
+    def test_rollback_on_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        conn_mod, pool = self._patch_pool(monkeypatch)
+        from crewai.gaussdb.config import GaussDBConfig
+        from crewai.gaussdb.connection import connection
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with connection(GaussDBConfig(database="db_x")) as conn:
+                raise RuntimeError("boom")
+        assert conn.rolled_back is True
+        assert conn.committed is False
+        assert conn.put_back is True
+
+
+@pytest.fixture(autouse=True)
+def _reset_pool():
+    import crewai.gaussdb.connection as conn_mod
+
+    conn_mod.reset_pool()
+    yield
+    conn_mod.reset_pool()
 
 
 requires_gaussdb = pytest.mark.skipif(

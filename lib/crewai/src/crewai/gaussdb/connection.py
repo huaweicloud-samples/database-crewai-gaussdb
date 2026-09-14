@@ -9,17 +9,21 @@ variant only adds locking).
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Iterator
+import threading
+from typing import TYPE_CHECKING, Any
 
 import psycopg2.extensions
 from psycopg2.pool import ThreadedConnectionPool
 
+
 if TYPE_CHECKING:
     from crewai.gaussdb.config import GaussDBConfig
 
-_pool = None
-_pool_key: tuple | None = None
+_pool_lock = threading.Lock()
+_pool: ThreadedConnectionPool | None = None
+_pool_key: dict[str, Any] | None = None
 
 
 def _create_pool_instance(
@@ -38,25 +42,34 @@ def _create_pool_instance(
 
 
 def get_pool(config: GaussDBConfig) -> ThreadedConnectionPool:
-    """Return the process-wide pool for *config*, rebuilding on change."""
+    """Return the process-wide pool for *config*, rebuilding on change.
+
+    All callers must pass an equivalent config for the process lifetime:
+    a rebuild closes every connection of the old pool, including ones
+    currently checked out.
+    """
     global _pool, _pool_key
     key = config.model_dump()
-    if _pool is not None and _pool_key == key:
+    with _pool_lock:
+        if _pool is not None and _pool_key == key:
+            return _pool
+        if _pool is not None:
+            _pool.closeall()
+        _pool = _create_pool_instance(
+            config, config.min_connections, config.max_connections
+        )
+        _pool_key = key
         return _pool
-    if _pool is not None:
-        _pool.closeall()
-    _pool = _create_pool_instance(config, config.min_connections, config.max_connections)
-    _pool_key = key
-    return _pool
 
 
 def reset_pool() -> None:
     """Close and forget the current pool (used between tests / on teardown)."""
     global _pool, _pool_key
-    if _pool is not None:
-        _pool.closeall()
-    _pool = None
-    _pool_key = None
+    with _pool_lock:
+        if _pool is not None:
+            _pool.closeall()
+        _pool = None
+        _pool_key = None
 
 
 @contextmanager
