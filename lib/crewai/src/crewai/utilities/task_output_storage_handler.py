@@ -6,6 +6,7 @@ from persistent storage, supporting replay and audit capabilities.
 
 from typing import Any
 
+from crewai.gaussdb.config import is_gaussdb_backend
 from crewai.memory.storage.kickoff_task_outputs_storage import (
     KickoffTaskOutputsSQLiteStorage,
 )
@@ -24,7 +25,16 @@ class TaskOutputStorageHandler:
 
     def __init__(self) -> None:
         """Initialize the task output storage handler."""
-        self.storage = KickoffTaskOutputsSQLiteStorage()
+        if is_gaussdb_backend():
+            from crewai.memory.storage.kickoff_task_outputs_gaussdb import (
+                GaussDBKickoffTaskOutputsStorage,
+            )
+
+            self.storage: (
+                GaussDBKickoffTaskOutputsStorage | KickoffTaskOutputsSQLiteStorage
+            ) = GaussDBKickoffTaskOutputsStorage()
+        else:
+            self.storage = KickoffTaskOutputsSQLiteStorage()
 
     def update(self, task_index: int, log: dict[str, Any]) -> None:
         """Update an existing task output in storage.
