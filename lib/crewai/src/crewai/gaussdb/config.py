@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class GaussDBConfig(BaseModel):
@@ -18,7 +18,12 @@ class GaussDBConfig(BaseModel):
     host: str = "localhost"
     port: int = 5432
     user: str = ""
-    password: str = ""
+    # Field(repr=False, exclude=True): the password must never appear in
+    # repr(), model_dump(), or checkpoint payloads (entities serialize their
+    # whole CheckpointConfig, and this provider is the first one that carries
+    # a secret). SecretStr alone is NOT enough — pydantic v2 model_dump
+    # (mode="json") would still emit the plaintext.
+    password: str = Field(default="", repr=False, exclude=True)
     database: str = "crewai"
     min_connections: int = 1
     max_connections: int = 10

@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import os
 from typing import Literal
 import uuid
 
-from pydantic import Field
+from pydantic import Field, model_validator
+from typing_extensions import Self
 
 from crewai.gaussdb.config import GaussDBConfig
 from crewai.state.provider.core import BaseProvider
@@ -63,6 +65,17 @@ class GaussDBProvider(BaseProvider):
 
     provider_type: Literal["gaussdb"] = Field(default="gaussdb")
     config: GaussDBConfig = Field(default_factory=GaussDBConfig.from_env)
+
+    @model_validator(mode="after")
+    def _fill_password_from_env(self) -> Self:
+        """Restored-from-payload providers carry an empty password (excluded
+        from serialization); re-fill it from the environment, matching the
+        connection-from-env design."""
+        if not self.config.password:
+            env_password = os.environ.get("GAUSSDB_PASSWORD", "")
+            if env_password:
+                self.config = self.config.model_copy(update={"password": env_password})
+        return self
 
     def checkpoint(
         self,

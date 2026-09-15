@@ -191,3 +191,34 @@ class TestProviderWiring:
         )
         assert result.returncode == 0, result.stderr
         assert "PSYCOPG2-FREE" in result.stdout
+
+    def test_password_never_serialized(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GAUSSDB_PASSWORD", "S3cr3t-PW")
+        monkeypatch.setenv("GAUSSDB_DATABASE", "unit_test_db")
+        from crewai.gaussdb.config import GaussDBConfig
+
+        cfg = GaussDBConfig.from_env()
+        dumped = cfg.model_dump(mode="json")
+        assert "password" not in dumped
+        assert "S3cr3t-PW" not in repr(cfg)
+        # dict(config) is unaffected by exclude (get_pool key depends on it)
+        assert dict(cfg)["password"] == "S3cr3t-PW"
+
+    def test_restored_provider_refills_password_from_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GAUSSDB_PASSWORD", "Env-PW")
+        monkeypatch.setenv("GAUSSDB_DATABASE", "unit_test_db")
+        from crewai.state.provider import gaussdb_provider as g
+
+        # Simulate a payload-restored config: password is empty (excluded).
+        cfg = g.GaussDBConfig(host="h", database="d", user="u", password="")
+        # Direct construction (not model_construct) so validators run:
+        provider2 = g.GaussDBProvider(config=cfg)
+        assert provider2.config.password == "Env-PW"
+        # Without a password in the environment it stays empty.
+        monkeypatch.delenv("GAUSSDB_PASSWORD")
+        provider3 = g.GaussDBProvider(config=cfg)
+        assert provider3.config.password == ""

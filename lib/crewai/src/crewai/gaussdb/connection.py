@@ -49,7 +49,11 @@ def get_pool(config: GaussDBConfig) -> ThreadedConnectionPool:
     currently checked out.
     """
     global _pool, _pool_key
-    key = config.model_dump()
+    # dict(config), not model_dump(): model_dump() honors field exclusion, so
+    # after password became exclude=True two configs differing only by
+    # password would collide on the same pool. dict(config) iterates the raw
+    # (name, value) pairs and keeps the password in the key.
+    key = dict(config)
     with _pool_lock:
         if _pool is not None and _pool_key == key:
             return _pool
