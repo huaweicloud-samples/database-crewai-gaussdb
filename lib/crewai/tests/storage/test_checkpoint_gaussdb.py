@@ -32,7 +32,10 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, fetchone=None, rowcount=0
 
         return ctx()
 
-    monkeypatch.setattr(g, "cursor", _fake_cursor_ctx)
+    # The provider imports cursor() inside its methods, so patch it at the
+    # source module; the function-level import resolves the attribute at
+    # call time.
+    monkeypatch.setattr("crewai.gaussdb.connection.cursor", _fake_cursor_ctx)
     provider = g.GaussDBProvider.model_construct(provider_type="gaussdb")
     return provider, executed, fake
 
@@ -139,3 +142,52 @@ class TestGaussDBProviderIntegration:
         provider = GaussDBProvider()
         loc = asyncio.run(provider.acheckpoint('{"a": true}', "gaussdb"))
         assert asyncio.run(provider.afrom_checkpoint(loc)) == '{"a": true}'
+
+
+class TestProviderWiring:
+    def test_detect_provider_recognizes_gaussdb(self) -> None:
+        from crewai.state.provider.gaussdb_provider import GaussDBProvider
+        from crewai.state.provider.utils import detect_provider
+
+        assert isinstance(detect_provider("gaussdb"), GaussDBProvider)
+        assert isinstance(
+            detect_provider("gaussdb#20260915T120000_abcd1234"), GaussDBProvider
+        )
+
+    def test_checkpoint_config_accepts_gaussdb_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CheckpointConfig(provider=GaussDBProvider()) no longer raises
+        ValidationError, and construction never touches the database."""
+        monkeypatch.setenv("CREWAI_STORAGE_BACKEND", "gaussdb")
+        from unittest.mock import MagicMock
+
+        from crewai.state import checkpoint_config as cc
+        from crewai.state.provider import gaussdb_provider as gp
+
+        monkeypatch.setattr(
+            gp.GaussDBProvider, "checkpoint", MagicMock(return_value="gaussdb#x")
+        )
+        config = cc.CheckpointConfig(provider=gp.GaussDBProvider())
+        assert config.provider.provider_type == "gaussdb"
+
+    def test_import_crewai_state_does_not_require_psycopg2(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """checkpoint_config imports GaussDBProvider at module level, yet the
+        import chain must not pull in psycopg2 (it is an optional extra)."""
+        import subprocess
+        import sys
+
+        monkeypatch.setenv("CREWAI_STORAGE_BACKEND", "gaussdb")
+        # Subprocess: the current interpreter may already have psycopg2 loaded.
+        code = (
+            "import sys; import crewai.state.checkpoint_config; "
+            "assert 'psycopg2' not in sys.modules, 'psycopg2 eagerly imported'; "
+            "print('PSYCOPG2-FREE')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+        assert "PSYCOPG2-FREE" in result.stdout

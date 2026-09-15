@@ -22,7 +22,6 @@ import uuid
 from pydantic import Field
 
 from crewai.gaussdb.config import GaussDBConfig
-from crewai.gaussdb.connection import cursor
 from crewai.state.provider.core import BaseProvider
 
 
@@ -75,6 +74,8 @@ class GaussDBProvider(BaseProvider):
     ) -> str:
         """Write a checkpoint. *location* is accepted for interface parity but
         ignored; the returned location is ``"gaussdb#<checkpoint_id>"``."""
+        from crewai.gaussdb.connection import cursor
+
         checkpoint_id, ts = _make_id()
         with cursor(self.config) as cur:
             for statement in _CREATE_SCHEMA_SQL:
@@ -95,6 +96,8 @@ class GaussDBProvider(BaseProvider):
         )
 
     def prune(self, location: str, max_keep: int, *, branch: str = "main") -> int:
+        from crewai.gaussdb.connection import cursor
+
         with cursor(self.config) as cur:
             cur.execute(_PRUNE_SQL, (branch, branch, max_keep))
             removed = cur.rowcount
@@ -104,6 +107,8 @@ class GaussDBProvider(BaseProvider):
         return location.rsplit("#", 1)[1]
 
     def from_checkpoint(self, location: str) -> str:
+        from crewai.gaussdb.connection import cursor
+
         checkpoint_id = location.rsplit("#", 1)[1]
         with cursor(self.config) as cur:
             cur.execute(_SELECT_SQL, (checkpoint_id,))

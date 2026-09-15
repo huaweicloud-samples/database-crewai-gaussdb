@@ -11,9 +11,10 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 def detect_provider(path: str) -> BaseProvider:
     """Detect the storage provider from a checkpoint path.
 
-    Reads the file's magic bytes to determine if it's a SQLite database.
-    For paths containing ``#``, checks the portion before the ``#``.
-    Falls back to JsonProvider.
+    Recognizes the ``"gaussdb"`` / ``"gaussdb#<checkpoint_id>"`` scheme used by
+    the GaussDB provider. For file paths, reads the magic bytes to determine if
+    it's a SQLite database. For paths containing ``#``, checks the portion
+    before the ``#``. Falls back to JsonProvider.
 
     Args:
         path: A checkpoint file path, directory, or ``db_path#checkpoint_id``.
@@ -21,8 +22,12 @@ def detect_provider(path: str) -> BaseProvider:
     Returns:
         The appropriate provider instance.
     """
+    from crewai.state.provider.gaussdb_provider import GaussDBProvider
     from crewai.state.provider.json_provider import JsonProvider
     from crewai.state.provider.sqlite_provider import SqliteProvider
+
+    if path == "gaussdb" or path.startswith("gaussdb#"):
+        return GaussDBProvider()
 
     file_path = path.split("#")[0] if "#" in path else path
     try:

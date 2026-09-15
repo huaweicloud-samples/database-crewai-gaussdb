@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from crewai.state.provider.gaussdb_provider import GaussDBProvider
 from crewai.state.provider.json_provider import JsonProvider
 from crewai.state.provider.sqlite_provider import SqliteProvider
 
@@ -175,7 +176,7 @@ class CheckpointConfig(BaseModel):
         'Use ["*"] to checkpoint on every event.',
     )
     provider: Annotated[
-        JsonProvider | SqliteProvider,
+        JsonProvider | SqliteProvider | GaussDBProvider,
         Field(discriminator="provider_type"),
     ] = Field(
         default_factory=JsonProvider,
