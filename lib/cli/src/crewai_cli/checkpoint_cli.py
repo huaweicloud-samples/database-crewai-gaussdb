@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import glob
 import json
 import os
 import re
 import sqlite3
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import click
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    import psycopg2.extensions
 
 
 def _record_checkpoint_usage(
@@ -72,6 +79,64 @@ FROM checkpoints
 WHERE id LIKE ?
 ORDER BY rowid DESC
 """
+
+# --- GaussDB backend ("gaussdb" / "gaussdb#<id>" locations) ---
+# Differences from the SQLite SQL above: the data column is JSONB (read via
+# ::text instead of json()), and ORDER BY rowid is replaced by the explicit
+# `seq` column (see crewai.state.provider.gaussdb_provider).
+
+_G_SELECT_ALL = """
+SELECT id, created_at, data::text
+FROM checkpoints
+ORDER BY seq DESC
+"""
+
+_G_SELECT_ONE = """
+SELECT id, created_at, data::text
+FROM checkpoints
+WHERE id = %s
+"""
+
+_G_SELECT_LATEST = """
+SELECT id, created_at, data::text
+FROM checkpoints
+ORDER BY seq DESC
+LIMIT 1
+"""
+
+_G_SELECT_LIKE = """
+SELECT id, created_at, data::text
+FROM checkpoints
+WHERE id LIKE %s
+ORDER BY seq DESC
+"""
+
+_G_DELETE_OLDER_THAN = """
+DELETE FROM checkpoints
+WHERE created_at < %s
+"""
+
+_G_DELETE_KEEP_N = """
+DELETE FROM checkpoints WHERE seq NOT IN (
+    SELECT seq FROM checkpoints ORDER BY seq DESC LIMIT %s
+)
+"""
+
+_G_COUNT_CHECKPOINTS = "SELECT COUNT(*) FROM checkpoints"
+
+
+def _is_gaussdb(location: str) -> bool:
+    """Recognize GaussDB checkpoint locations (``gaussdb`` / ``gaussdb#id``)."""
+    return location == "gaussdb" or location.startswith("gaussdb#")
+
+
+@contextmanager
+def _gaussdb_cursor() -> Iterator[psycopg2.extensions.cursor]:
+    from crewai.gaussdb.config import GaussDBConfig
+    from crewai.gaussdb.connection import cursor
+
+    with cursor(GaussDBConfig.from_env()) as cur:
+        yield cur
 
 
 _DEFAULT_DIR = "./.checkpoints"
@@ -339,6 +404,22 @@ def _info_sqlite_id(db_path: str, checkpoint_id: str) -> dict[str, Any] | None:
 
 def list_checkpoints(location: str) -> None:
     """List all checkpoints at a location."""
+    if _is_gaussdb(location):
+        entries = _list_gaussdb()
+        label = "GaussDB"
+        if not entries:
+            click.echo(f"No checkpoints found in {label}")
+            return
+        click.echo(f"Found {len(entries)} checkpoint(s) in {label}\n")
+        for entry in entries:
+            ts = entry.get("ts") or "unknown"
+            name = entry.get("name", "")
+            trigger = entry.get("trigger") or ""
+            summary = _entity_summary(entry.get("entities", []))
+            parts = [name, ts, trigger, summary]
+            click.echo(f"  {'  '.join(parts)}")
+        return
+
     if _is_sqlite(location):
         entries = _list_sqlite(location)
         label = f"SQLite: {location}"
@@ -373,6 +454,19 @@ def list_checkpoints(location: str) -> None:
 def info_checkpoint(path: str) -> None:
     """Show details of a single checkpoint."""
     meta: dict[str, Any] | None = None
+
+    if _is_gaussdb(path):
+        if path.count("#") == 1 and path.rsplit("#", 1)[1]:
+            meta = _info_gaussdb_id(path.rsplit("#", 1)[1])
+        else:
+            meta = _info_gaussdb_latest()
+            if meta:
+                click.echo("Latest checkpoint:\n")
+        if not meta:
+            click.echo("Checkpoint not found in GaussDB")
+            return
+        _print_info(meta)
+        return
 
     if "#" in path:
         db_path, checkpoint_id = path.rsplit("#", 1)
@@ -447,6 +541,10 @@ def _print_info(meta: dict[str, Any]) -> None:
 def _resolve_checkpoint(
     location: str, checkpoint_id: str | None
 ) -> dict[str, Any] | None:
+    if _is_gaussdb(location):
+        if checkpoint_id:
+            return _info_gaussdb_id(checkpoint_id)
+        return _info_gaussdb_latest()
     if _is_sqlite(location):
         if checkpoint_id:
             return _info_sqlite_id(location, checkpoint_id)
@@ -704,6 +802,72 @@ def _prune_sqlite(db_path: str, keep: int | None, older_than: timedelta | None) 
     return deleted
 
 
+def _list_gaussdb() -> list[dict[str, Any]]:
+    results = []
+    with _gaussdb_cursor() as cur:
+        cur.execute(_G_SELECT_ALL)
+        for row in cur.fetchall():
+            checkpoint_id, created_at, raw = row
+            try:
+                meta = _parse_checkpoint_json(raw, source=checkpoint_id)
+                meta["name"] = checkpoint_id
+                meta["ts"] = _ts_from_name(checkpoint_id) or created_at
+            except Exception:
+                meta = {
+                    "name": checkpoint_id,
+                    "ts": created_at,
+                    "entities": [],
+                    "source": checkpoint_id,
+                }
+            meta["db"] = "gaussdb"
+            results.append(meta)
+    return results
+
+
+def _info_gaussdb_latest() -> dict[str, Any] | None:
+    with _gaussdb_cursor() as cur:
+        cur.execute(_G_SELECT_LATEST)
+        row = cur.fetchone()
+    if not row:
+        return None
+    checkpoint_id, created_at, raw = row
+    meta = _parse_checkpoint_json(raw, source=checkpoint_id)
+    meta["name"] = checkpoint_id
+    meta["ts"] = _ts_from_name(checkpoint_id) or created_at
+    meta["db"] = "gaussdb"
+    return meta
+
+
+def _info_gaussdb_id(checkpoint_id: str) -> dict[str, Any] | None:
+    with _gaussdb_cursor() as cur:
+        cur.execute(_G_SELECT_ONE, (checkpoint_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.execute(_G_SELECT_LIKE, (f"%{checkpoint_id}%",))
+            row = cur.fetchone()
+    if not row:
+        return None
+    cid, created_at, raw = row
+    meta = _parse_checkpoint_json(raw, source=cid)
+    meta["name"] = cid
+    meta["ts"] = _ts_from_name(cid) or created_at
+    meta["db"] = "gaussdb"
+    return meta
+
+
+def _prune_gaussdb(keep: int | None, older_than: timedelta | None) -> int:
+    deleted = 0
+    with _gaussdb_cursor() as cur:
+        if older_than is not None:
+            cutoff = (datetime.now(timezone.utc) - older_than).strftime("%Y%m%dT%H%M%S")
+            cur.execute(_G_DELETE_OLDER_THAN, (cutoff,))
+            deleted += cur.rowcount
+        if keep is not None:
+            cur.execute(_G_DELETE_KEEP_N, (keep,))
+            deleted += cur.rowcount
+    return deleted
+
+
 def prune_checkpoints(
     location: str, keep: int | None, older_than: str | None, dry_run: bool = False
 ) -> None:
@@ -715,6 +879,18 @@ def prune_checkpoints(
     _record_checkpoint_usage("prune")
 
     deleted: int
+    if _is_gaussdb(location):
+        if dry_run:
+            with _gaussdb_cursor() as cur:
+                cur.execute(_G_COUNT_CHECKPOINTS)
+                row = cur.fetchone()
+            count = int(row[0]) if row else 0
+            click.echo(f"Would prune from {count} checkpoint(s) in GaussDB")
+            return
+        deleted = _prune_gaussdb(keep, duration)
+        click.echo(f"Pruned {deleted} checkpoint(s) from GaussDB")
+        return
+
     if _is_sqlite(location):
         if dry_run:
             with sqlite3.connect(location) as conn:
