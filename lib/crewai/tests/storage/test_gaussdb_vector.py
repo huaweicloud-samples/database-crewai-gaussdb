@@ -6,6 +6,8 @@ import pytest
 
 from crewai.gaussdb.vector import (
     calc_pq_nseg,
+    is_distributed,
+    upsert_via_merge,
     validate_dimension,
     vector_index_ddl,
 )
@@ -65,6 +67,73 @@ class TestVectorIndexDdl:
     def test_large_dim_distributed_raises(self) -> None:
         with pytest.raises(ValueError, match="1024"):
             vector_index_ddl("my_idx", "my_table", "embedding", 1536, distributed=True)
+
+
+class _RecordingCursor:
+    """Minimal cursor double recording execute calls (no DB connection).
+
+    Same recorder idea as _install_fakes in test_kickoff_outputs_gaussdb.py,
+    but the helpers under test take a cursor directly — no monkeypatch needed.
+    """
+
+    def __init__(self, fetchone_result: tuple | None = None) -> None:
+        self.executed: list[tuple[str, tuple]] = []
+        self._fetchone_result = fetchone_result
+
+    def execute(self, sql: str, params: tuple | None = None) -> None:
+        self.executed.append((sql, params or ()))
+
+    def fetchone(self) -> tuple | None:
+        return self._fetchone_result
+
+
+class TestIsDistributedFakeCursor:
+    def test_pgxc_node_count_decides_topology(self) -> None:
+        cur = _RecordingCursor(fetchone_result=(3,))
+        assert is_distributed(cur) is True
+        cur0 = _RecordingCursor(fetchone_result=(0,))  # 集中式：空表 count=0
+        assert is_distributed(cur0) is False
+        assert "SELECT count(*) FROM pgxc_node" in cur.executed[0][0]
+
+
+class TestUpsertViaMergeFakeCursor:
+    def test_merge_statement_shape(self) -> None:
+        cur = _RecordingCursor()
+        upsert_via_merge(
+            cur,
+            "probe_t",
+            ["id"],
+            [{"id": "r0", "content": "c", "embedding": [0.1, 0.2]}],
+            "embedding",
+        )
+        assert len(cur.executed) == 1
+        sql, params = cur.executed[0]
+        assert "MERGE INTO probe_t" in sql
+        assert "jsonb_array_elements" in sql
+        assert "%s::jsonb" in sql
+        assert "(e->>'embedding')::floatvector" in sql
+        assert "t.id = s.id" in sql
+        # 向量在 payload 里编码为 '[...]' 文本，随 jsonb 参数传递
+        assert "embedding" in params[0]
+
+    def test_empty_payload_executes_nothing(self) -> None:
+        cur = _RecordingCursor()
+        upsert_via_merge(cur, "probe_t", ["id"], [], "embedding")
+        assert cur.executed == []
+
+    def test_rejects_key_not_in_payload(self) -> None:
+        cur = _RecordingCursor()
+        with pytest.raises(ValueError, match="key_columns"):
+            upsert_via_merge(
+                cur, "probe_t", ["missing"], [{"id": "r0", "content": "c"}], "embedding"
+            )
+        assert cur.executed == []
+
+    def test_rejects_all_key_payload(self) -> None:
+        cur = _RecordingCursor()
+        with pytest.raises(ValueError, match="non-key"):
+            upsert_via_merge(cur, "probe_t", ["id"], [{"id": "r0"}], "embedding")
+        assert cur.executed == []
 
 
 import os

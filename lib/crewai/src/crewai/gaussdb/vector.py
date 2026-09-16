@@ -43,7 +43,11 @@ def calc_pq_nseg(dim: int) -> int:
 
 
 def is_distributed(cursor: Psycopg2Cursor) -> bool:
-    """Detect deployment topology (pgxc_node only exists on distributed)."""
+    """Detect deployment topology.
+
+    pgxc_node is empty on centralized instances (507 creates an empty
+    pgxc_node table), so count=0 means centralized; rows mean distributed.
+    """
     cursor.execute("SELECT count(*) FROM pgxc_node")
     row = cursor.fetchone()
     return bool(row and row[0])
@@ -100,6 +104,11 @@ def ensure_vector_index(
     Must run inside a transaction on one pooled connection: DiskANN needs
     maintenance_work_mem >= 512MB (quoted value), and the probe GUCs are set
     for subsequent searches on the same session.
+
+    Concurrency: CREATE INDEX IF NOT EXISTS has a check-then-create race —
+    two connections racing can hit a pg_class unique-key violation. Callers
+    must serialize via crewai_core.lock_store (store_lock) or retry on
+    duplicate-key errors.
     """
     distributed = is_distributed(cursor)
     cursor.execute("SET maintenance_work_mem = '512MB'")
@@ -142,20 +151,28 @@ def upsert_via_merge(
         payload: Rows as dicts. The vector column holds a float sequence;
             other values must be JSON-serializable scalars/strings (callers
             pre-encode non-scalar values like JSON text).
+            NOTE: BOOLEAN columns are NOT supported — GaussDB (both A and ORA
+            modes) has no implicit text→boolean assignment cast, so a bool
+            value would fail with "column is of type boolean but expression
+            is of type text". Encode booleans as SMALLINT (0/1) columns or
+            'true'/'false' TEXT with an explicit cast at read time.
         vector_column: The floatvector column name.
     """
     if not payload:
         return
     all_columns = list(payload[0].keys())
+    if not key_columns or not set(key_columns) <= set(all_columns):
+        raise ValueError("key_columns must be non-empty and subset of payload keys")
+    non_key = [c for c in all_columns if c not in key_columns]
+    if not non_key:
+        raise ValueError("payload must contain at least one non-key column to update")
     using = ", ".join(
         f"(e->>'{col}')::floatvector AS {col}"
         if col == vector_column
         else f"e->>'{col}' AS {col}"
         for col in all_columns
     )
-    update_set = ", ".join(
-        f"{col} = s.{col}" for col in all_columns if col not in key_columns
-    )
+    update_set = ", ".join(f"{col} = s.{col}" for col in non_key)
     insert_cols = ", ".join(all_columns)
     insert_vals = ", ".join(f"s.{col}" for col in all_columns)
     on_clause = " AND ".join(f"t.{k} = s.{k}" for k in key_columns)
