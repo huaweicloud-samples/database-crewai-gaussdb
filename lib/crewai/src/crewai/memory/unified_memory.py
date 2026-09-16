@@ -239,6 +239,10 @@ class Memory(BaseModel):
                 from crewai.memory.storage.qdrant_edge_storage import QdrantEdgeStorage
 
                 self._storage = QdrantEdgeStorage()
+            elif self.storage == "gaussdb":
+                from crewai.memory.storage.gaussdb_storage import GaussDBStorage
+
+                self._storage = GaussDBStorage()
             elif self.storage == "lancedb":
                 from crewai.memory.storage.lancedb_storage import LanceDBStorage
 
