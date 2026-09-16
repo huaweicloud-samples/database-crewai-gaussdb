@@ -20,7 +20,20 @@ logger = logging.getLogger(__name__)
 
 
 def load_task_outputs(db_path: str | None = None) -> list[dict[str, Any]]:
-    """Return all rows from the kickoff task outputs database."""
+    """Return all rows from the kickoff task outputs database.
+
+    When ``CREWAI_STORAGE_BACKEND=gaussdb`` (and no explicit db_path), rows
+    are read from the GaussDB backend configured via ``GAUSSDB_*`` env vars;
+    psycopg2 being missing degrades to an empty result like a missing file.
+    """
+    if db_path is None:
+        try:
+            from crewai.gaussdb.config import is_gaussdb_backend
+        except ImportError:
+            is_gaussdb_backend = None  # type: ignore[assignment]
+        if is_gaussdb_backend is not None and is_gaussdb_backend():
+            return _load_task_outputs_gaussdb()
+
     if db_path is None:
         db_path = str(Path(_db_storage_path()) / "latest_kickoff_task_outputs.db")
 
@@ -51,6 +64,46 @@ def load_task_outputs(db_path: str | None = None) -> list[dict[str, Any]]:
             "inputs": _safe_json_loads(row["inputs"]),
             "was_replayed": row["was_replayed"],
             "timestamp": row["timestamp"],
+        }
+        for row in rows
+    ]
+
+
+def _load_task_outputs_gaussdb() -> list[dict[str, Any]]:
+    """Read kickoff outputs from GaussDB (mirrors the SQLite row shape)."""
+    try:
+        from crewai.gaussdb.config import GaussDBConfig
+        from crewai.gaussdb.connection import cursor
+    except ImportError as e:
+        logger.warning("GaussDB backend selected but psycopg2 is not installed: %s", e)
+        return []
+
+    try:
+        with cursor(GaussDBConfig.from_env()) as cur:
+            cur.execute(
+                """
+                SELECT task_id, expected_output, output, task_index,
+                       inputs, was_replayed, timestamp
+                FROM latest_kickoff_task_outputs
+                ORDER BY task_index
+                """
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        # Missing table (first use) or an unreachable DB: degraded read,
+        # mirroring the SQLite version's "no file → []" behavior.
+        logger.error("Failed to load task outputs from GaussDB: %s", e)
+        return []
+
+    return [
+        {
+            "task_id": row[0],
+            "expected_output": row[1],
+            "output": _safe_json_loads(row[2]),
+            "task_index": row[3],
+            "inputs": _safe_json_loads(row[4]),
+            "was_replayed": bool(row[5]),
+            "timestamp": row[6].isoformat(sep=" ") if row[6] else None,
         }
         for row in rows
     ]
