@@ -224,6 +224,32 @@ class GaussDBStorage:
         """Update a record by ID (MERGE upsert; same semantics as save)."""
         self.save([record])
 
+    def touch_records(
+        self, record_ids: list[str], accessed_at: datetime | None = None
+    ) -> int:
+        """Update last_accessed for the given records (recall side-effect).
+
+        Mirrors LanceDB's ``touch_records`` (same single-column UPDATE,
+        ``store_lock`` held, no-op on empty ids) but parameterized — safer
+        than LanceDB's string-concatenated WHERE. Returns the number of rows
+        updated; a missing table returns 0, matching ``get_record``.
+
+        The default timestamp is naive UTC (``datetime.utcnow``), same as
+        LanceDB: ``last_accessed`` ISO strings must stay naive so
+        lexicographic order keeps matching chronological order.
+        """
+        if not record_ids:
+            return 0
+        timestamp = (accessed_at or datetime.utcnow()).isoformat()
+        with store_lock(self._lock_name), cursor(self.config) as cur:
+            if not self._table_exists(cur):
+                return 0
+            cur.execute(
+                "UPDATE memories SET last_accessed = %s WHERE id = ANY(%s)",
+                (timestamp, record_ids),
+            )
+            return int(cur.rowcount)
+
     def search(
         self,
         query_embedding: list[float],
@@ -249,6 +275,16 @@ class GaussDBStorage:
         with cursor(self.config) as cur:
             if not self._table_exists(cur):
                 return []
+            # Set the probe GUCs for this session (same values as
+            # ensure_vector_index): pooled recall-only processes never run
+            # save(), so without this they search with default probes and
+            # recall quality silently degrades. Unknown dim (no save yet in
+            # this process) — skip; the default probes are functionally
+            # correct, just less thorough.
+            if self._dim is not None and self._dim > 1024:
+                cur.execute("SET diskann_probe_ncandidates = 200")
+            elif self._dim is not None:
+                cur.execute("SET gsivfflat_probes = 25")
             cur.execute(sql, tuple(params))
             rows = cur.fetchall()
         out: list[tuple[MemoryRecord, float]] = []
@@ -276,7 +312,7 @@ class GaussDBStorage:
         if record_ids is not None and not record_ids:
             return 0
         pattern = _scope_like(scope_prefix)
-        with cursor(self.config) as cur:
+        with store_lock(self._lock_name), cursor(self.config) as cur:
             if not self._table_exists(cur):
                 return 0
             if categories or metadata_filter:

@@ -219,6 +219,41 @@ class TestSave:
         assert row["content"] == "updated"
 
 
+class TestTouchRecords:
+    def test_sql_shape_and_rowcount(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakeCursor(fetchone_map={"pg_tables": (1,)}, rowcount=2)
+        storage = _make_storage(fake, monkeypatch)
+        assert storage.touch_records(["a", "b"], accessed_at=datetime(2026, 3, 1)) == 2
+        sql, params = fake.executed[-1]
+        assert sql == "UPDATE memories SET last_accessed = %s WHERE id = ANY(%s)"
+        assert params[0] == "2026-03-01T00:00:00"
+        assert params[1] == ["a", "b"]
+
+    def test_default_timestamp_is_naive_now(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeCursor(fetchone_map={"pg_tables": (1,)}, rowcount=1)
+        storage = _make_storage(fake, monkeypatch)
+        storage.touch_records(["a"])
+        parsed = datetime.fromisoformat(fake.executed[-1][1][0])
+        assert parsed.tzinfo is None  # naive, keeps ISO lexicographic order
+        assert parsed > datetime(2026, 1, 1)
+
+    def test_empty_ids_returns_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakeCursor(fetchone_map={"pg_tables": (1,)}, rowcount=2)
+        storage = _make_storage(fake, monkeypatch)
+        assert storage.touch_records([]) == 0
+        assert fake.executed == []
+
+    def test_table_missing_returns_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeCursor()
+        storage = _make_storage(fake, monkeypatch)
+        assert storage.touch_records(["a"]) == 0
+        assert not any("UPDATE" in sql for sql, _ in fake.executed)
+
+
 class TestSearch:
     def test_sql_shape_and_params(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = FakeCursor(
@@ -784,6 +819,15 @@ class TestGaussDBStorageIntegration:
             assert got2.content == "alpha2"
             assert got2.last_accessed == datetime(2026, 2, 1)
             assert storage.count() == 3  # update replaced, not added
+
+            # touch_records: recall side-effect bumps last_accessed (=ANY list
+            # adaptation is exercised for real here).
+            touched = storage.touch_records([recs[1].id])
+            assert touched == 1
+            after_touch = storage.get_record(recs[1].id)
+            assert after_touch is not None
+            assert after_touch.last_accessed > datetime(2026, 1, 2)
+            assert storage.touch_records([]) == 0
 
             assert storage.count("/test") == 3
             assert storage.list_categories() == {"x": 2, "y": 1}
