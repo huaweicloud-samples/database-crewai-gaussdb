@@ -160,6 +160,8 @@ def _reset_pool():
     conn_mod.reset_pool()
 
 
+# NOTE: with GAUSSDB_TEST=1 the integration tests below share one physical
+# database; run the suite serially (pytest -n 0) to avoid parallel-DDL flakiness.
 requires_gaussdb = pytest.mark.skipif(
     os.environ.get("GAUSSDB_TEST", "").lower() != "1",
     reason="requires GAUSSDB_TEST=1 and a reachable GaussDB instance",

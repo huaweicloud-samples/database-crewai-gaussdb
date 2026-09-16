@@ -739,3 +739,55 @@ A: Yes, CrewAI provides extensive beginner-friendly tutorials, courses, and docu
 ### Q: Can CrewAI automate human-in-the-loop workflows?
 
 A: Yes, CrewAI fully supports human-in-the-loop workflows, allowing seamless collaboration between human experts and AI agents for enhanced decision-making.
+
+## GaussDB Storage Backend (optional)
+
+crewAI's relational storage (flow state persistence, kickoff task outputs,
+checkpoints) can be backed by Huawei GaussDB instead of local SQLite files.
+Vector storage (Memory/Knowledge) support ships in a follow-up release.
+
+### Install
+
+```shell
+uv sync --extra gaussdb    # or: pip install "crewai[gaussdb]"
+```
+
+### Enable
+
+Set the backend switch and connection parameters:
+
+```shell
+CREWAI_STORAGE_BACKEND=gaussdb
+GAUSSDB_HOST=localhost
+GAUSSDB_PORT=5432
+GAUSSDB_USER=appuser
+GAUSSDB_PASSWORD=...
+GAUSSDB_DATABASE=crewai
+GAUSSDB_MIN_CONNECTIONS=1          # optional, default 1
+GAUSSDB_MAX_CONNECTIONS=10         # optional, default 10
+```
+
+With the switch set, flow-state persistence, kickoff task outputs, and
+checkpoints all use GaussDB; without it everything behaves exactly as before
+(local SQLite). The CLI readers (`crewai checkpoint list/info/prune`,
+`crewai log-tasks-outputs`) follow the same switch.
+
+### Checkpoints
+
+Pass `location="gaussdb"` (or use `gaussdb#<checkpoint_id>` locations) to store
+checkpoints in GaussDB:
+
+```python
+CheckpointConfig(location="gaussdb", provider=GaussDBProvider())
+```
+
+`crewai checkpoint list gaussdb` / `info` / `prune` read the same backend.
+
+### Notes
+
+- Requires a GaussDB database in Oracle-compatible mode (DBCOMPATIBILITY='A').
+- The database password is never serialized (excluded from checkpoint payloads);
+  restored providers re-read it from `GAUSSDB_PASSWORD`.
+- Integration tests: set `GAUSSDB_TEST=1` plus the connection vars and run with
+  `pytest -n 0` (serial) — the shared test database does not tolerate parallel
+  DDL from multiple xdist workers.

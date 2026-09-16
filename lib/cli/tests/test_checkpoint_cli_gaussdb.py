@@ -107,3 +107,15 @@ class TestCheckpointCliGaussDB:
         prune_checkpoints("gaussdb", keep=None, older_than="8d")
         out = capsys.readouterr().out
         assert "Pruned 0 checkpoint(s)" in out
+
+    def test_resolve_checkpoint_gaussdb(self, seeded_gaussdb_checkpoints) -> None:
+        from crewai_cli.checkpoint_cli import _resolve_checkpoint
+
+        meta = _resolve_checkpoint("gaussdb", seeded_gaussdb_checkpoints[0].rsplit("#", 1)[1])
+        assert meta is not None
+        assert meta["db"] == "gaussdb"
+        assert meta["name"] == seeded_gaussdb_checkpoints[0].rsplit("#", 1)[1]
+
+        meta_latest = _resolve_checkpoint("gaussdb", None)
+        assert meta_latest is not None
+        assert meta_latest["db"] == "gaussdb"

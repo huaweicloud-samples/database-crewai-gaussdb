@@ -155,6 +155,11 @@ class TestHandlerBranch:
     os.environ.get("GAUSSDB_TEST", "").lower() != "1",
     reason="requires GAUSSDB_TEST=1 and a reachable GaussDB instance",
 )
+# pytest-recording's --block-network patches socket.socket.connect, which breaks
+# Windows asyncio.run(): ProactorEventLoop._make_self_pipe needs a loopback
+# socketpair. Allow loopback only (psycopg2 connects from C and is unaffected);
+# the tests are skipped unless GAUSSDB_TEST=1 anyway.
+@pytest.mark.block_network(allowed_hosts=[r"127\.0\.0\.1", r"localhost", r"::1"])
 class TestGaussDBKickoffIntegration:
     def test_full_cycle(self) -> None:
         from crewai.gaussdb.config import GaussDBConfig
