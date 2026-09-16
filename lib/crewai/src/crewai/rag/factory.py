@@ -5,6 +5,7 @@ from typing import cast
 
 from crewai.rag.config.optional_imports.protocols import (
     ChromaFactoryModule,
+    GaussDBFactoryModule,
     QdrantFactoryModule,
 )
 from crewai.rag.config.types import RagConfigType
@@ -74,5 +75,15 @@ def create_client(config: RagConfigType) -> BaseClient:
             ),
         )
         return qdrant_mod.create_client(config)
+
+    if config.provider == "gaussdb":
+        gaussdb_mod = cast(
+            GaussDBFactoryModule,
+            require(
+                "crewai.rag.gaussdb.factory",
+                purpose="The 'gaussdb' provider",
+            ),
+        )
+        return gaussdb_mod.create_client(config)
 
     raise ValueError(f"Unsupported provider: {config.provider}")

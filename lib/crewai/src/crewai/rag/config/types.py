@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     from crewai.rag.chromadb.config import ChromaDBConfig as ChromaDBConfig_
 
     ChromaDBConfig = ChromaDBConfig_
+    from crewai.rag.gaussdb.config import GaussDBRagConfig as GaussDBRagConfig_
+
+    GaussDBRagConfig = GaussDBRagConfig_
     from crewai.rag.qdrant.config import QdrantConfig as QdrantConfig_
 
     QdrantConfig = QdrantConfig_
@@ -24,13 +27,20 @@ else:
         )
 
     try:
+        from crewai.rag.gaussdb.config import GaussDBRagConfig
+    except ImportError:
+        from crewai.rag.config.optional_imports.providers import (
+            MissingGaussDBRagConfig as GaussDBRagConfig,
+        )
+
+    try:
         from crewai.rag.qdrant.config import QdrantConfig
     except ImportError:
         from crewai.rag.config.optional_imports.providers import (
             MissingQdrantConfig as QdrantConfig,
         )
 
-SupportedProviderConfig: TypeAlias = ChromaDBConfig | QdrantConfig
+SupportedProviderConfig: TypeAlias = ChromaDBConfig | QdrantConfig | GaussDBRagConfig
 RagConfigType: TypeAlias = Annotated[
     SupportedProviderConfig, Field(discriminator=DISCRIMINATOR)
 ]

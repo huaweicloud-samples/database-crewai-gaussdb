@@ -121,6 +121,34 @@ class TestUpsertViaMergeFakeCursor:
         upsert_via_merge(cur, "probe_t", ["id"], [], "embedding")
         assert cur.executed == []
 
+    def test_cast_columns_emit_server_cast(self) -> None:
+        cur = _RecordingCursor()
+        upsert_via_merge(
+            cur,
+            "probe_t",
+            ["id"],
+            [{"id": "r0", "content": "c", "metadata": '{"k": "v"}'}],
+            "embedding",
+            cast_columns={"metadata": "jsonb"},
+        )
+        sql, _ = cur.executed[0]
+        # JSONB 列无隐式 text→jsonb 赋值 cast（实测 507 O-mode），必须显式
+        assert "(e->>'metadata')::jsonb AS metadata" in sql
+        assert "(e->>'content')::jsonb" not in sql
+
+    def test_rejects_cast_column_not_in_payload(self) -> None:
+        cur = _RecordingCursor()
+        with pytest.raises(ValueError, match="cast_columns"):
+            upsert_via_merge(
+                cur,
+                "probe_t",
+                ["id"],
+                [{"id": "r0", "content": "c"}],
+                "embedding",
+                cast_columns={"missing": "jsonb"},
+            )
+        assert cur.executed == []
+
     def test_rejects_key_not_in_payload(self) -> None:
         cur = _RecordingCursor()
         with pytest.raises(ValueError, match="key_columns"):

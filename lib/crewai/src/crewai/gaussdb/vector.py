@@ -138,6 +138,7 @@ def upsert_via_merge(
     key_columns: list[str],
     payload: list[dict[str, Any]],
     vector_column: str,
+    cast_columns: dict[str, str] | None = None,
 ) -> None:
     """Batch upsert via a single MERGE + jsonb_array_elements payload.
 
@@ -156,19 +157,31 @@ def upsert_via_merge(
             value would fail with "column is of type boolean but expression
             is of type text". Encode booleans as SMALLINT (0/1) columns or
             'true'/'false' TEXT with an explicit cast at read time.
+            Same limitation for JSONB columns: pass the target type via
+            ``cast_columns={"metadata": "jsonb"}`` so the using-clause emits
+            ``(e->>'col')::jsonb`` (text→jsonb has no implicit assignment
+            cast either, verified on GaussDB 507 O-mode).
         vector_column: The floatvector column name.
+        cast_columns: Optional map of column name → server-side cast type
+            applied in the using-clause. Values are trusted schema type
+            names (caller constants, not user input).
     """
     if not payload:
         return
     all_columns = list(payload[0].keys())
     if not key_columns or not set(key_columns) <= set(all_columns):
         raise ValueError("key_columns must be non-empty and subset of payload keys")
+    if cast_columns and not set(cast_columns) <= set(all_columns):
+        raise ValueError("cast_columns keys must be a subset of payload keys")
     non_key = [c for c in all_columns if c not in key_columns]
     if not non_key:
         raise ValueError("payload must contain at least one non-key column to update")
+    casts = cast_columns or {}
     using = ", ".join(
         f"(e->>'{col}')::floatvector AS {col}"
         if col == vector_column
+        else f"(e->>'{col}')::{casts[col]} AS {col}"
+        if col in casts
         else f"e->>'{col}' AS {col}"
         for col in all_columns
     )

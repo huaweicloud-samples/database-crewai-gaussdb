@@ -21,3 +21,10 @@ class MissingQdrantConfig(_MissingProvider):
     """Placeholder for missing Qdrant configuration."""
 
     provider: Literal["qdrant"] = field(default="qdrant")
+
+
+@pyd_dataclass(config=ConfigDict(extra="forbid"))
+class MissingGaussDBRagConfig(_MissingProvider):
+    """Placeholder for missing GaussDB RAG configuration."""
+
+    provider: Literal["gaussdb"] = field(default="gaussdb")
