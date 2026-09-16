@@ -86,7 +86,7 @@ ORDER BY rowid DESC
 # `seq` column (see crewai.state.provider.gaussdb_provider).
 
 _G_SELECT_ALL = """
-SELECT id, created_at, data::text
+SELECT id, created_at, octet_length(data::text), data::text
 FROM checkpoints
 ORDER BY seq DESC
 """
@@ -132,9 +132,14 @@ def _is_gaussdb(location: str) -> bool:
 
 @contextmanager
 def _gaussdb_cursor() -> Iterator[psycopg2.extensions.cursor]:
-    from crewai.gaussdb.config import GaussDBConfig
-    from crewai.gaussdb.connection import cursor
-
+    try:
+        from crewai.gaussdb.config import GaussDBConfig
+        from crewai.gaussdb.connection import cursor
+    except ImportError as e:
+        raise click.ClickException(
+            "GaussDB backend requires the psycopg2 package. "
+            "Install it with: pip install psycopg2-binary"
+        ) from e
     with cursor(GaussDBConfig.from_env()) as cur:
         yield cur
 
@@ -414,9 +419,15 @@ def list_checkpoints(location: str) -> None:
         for entry in entries:
             ts = entry.get("ts") or "unknown"
             name = entry.get("name", "")
+            size = _format_size(entry["size"]) if "size" in entry else ""
             trigger = entry.get("trigger") or ""
             summary = _entity_summary(entry.get("entities", []))
-            parts = [name, ts, trigger, summary]
+            parts = [name, ts]
+            if size:
+                parts.append(size)
+            if trigger:
+                parts.append(trigger)
+            parts.append(summary)
             click.echo(f"  {'  '.join(parts)}")
         return
 
@@ -807,7 +818,7 @@ def _list_gaussdb() -> list[dict[str, Any]]:
     with _gaussdb_cursor() as cur:
         cur.execute(_G_SELECT_ALL)
         for row in cur.fetchall():
-            checkpoint_id, created_at, raw = row
+            checkpoint_id, created_at, size, raw = row
             try:
                 meta = _parse_checkpoint_json(raw, source=checkpoint_id)
                 meta["name"] = checkpoint_id
@@ -820,6 +831,7 @@ def _list_gaussdb() -> list[dict[str, Any]]:
                     "source": checkpoint_id,
                 }
             meta["db"] = "gaussdb"
+            meta["size"] = size
             results.append(meta)
     return results
 

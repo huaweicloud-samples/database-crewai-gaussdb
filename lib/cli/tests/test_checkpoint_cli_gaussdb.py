@@ -97,3 +97,13 @@ class TestCheckpointCliGaussDB:
         prune_checkpoints("gaussdb", keep=2, older_than=None, dry_run=True)
         out = capsys.readouterr().out
         assert "Would prune from 3 checkpoint(s)" in out
+
+    def test_prune_older_than(self, seeded_gaussdb_checkpoints, capsys) -> None:
+        from crewai_cli.checkpoint_cli import prune_checkpoints
+
+        # All seeds were just written, so an 8-day cutoff deletes nothing
+        # (created_at and the cutoff share the %Y%m%dT%H%M%S string format,
+        # making the SQL comparison a correct lexicographic date compare).
+        prune_checkpoints("gaussdb", keep=None, older_than="8d")
+        out = capsys.readouterr().out
+        assert "Pruned 0 checkpoint(s)" in out

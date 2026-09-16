@@ -2,7 +2,9 @@
 
 Only used by the ``crewai log-tasks-outputs`` CLI command.  Depends solely on
 the standard library + *appdirs* so crewai-cli can read stored outputs without
-importing the full crewai framework.
+importing the full crewai framework.  Exception: the GaussDB backend branch
+does import the full crewai framework (psycopg2 extra required) and degrades
+to an empty result when those imports fail.
 """
 
 from __future__ import annotations
@@ -74,8 +76,9 @@ def _load_task_outputs_gaussdb() -> list[dict[str, Any]]:
     try:
         from crewai.gaussdb.config import GaussDBConfig
         from crewai.gaussdb.connection import cursor
+        from psycopg2 import Error as Psycopg2Error
     except ImportError as e:
-        logger.warning("GaussDB backend selected but psycopg2 is not installed: %s", e)
+        logger.warning("crewai.gaussdb.connection is not importable: %s", e)
         return []
 
     try:
@@ -89,9 +92,7 @@ def _load_task_outputs_gaussdb() -> list[dict[str, Any]]:
                 """
             )
             rows = cur.fetchall()
-    except Exception as e:
-        # Missing table (first use) or an unreachable DB: degraded read,
-        # mirroring the SQLite version's "no file → []" behavior.
+    except Psycopg2Error as e:  # connect failures / missing table (first use) → []
         logger.error("Failed to load task outputs from GaussDB: %s", e)
         return []
 

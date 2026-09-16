@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import builtins
 from collections.abc import Generator
 import os
 from unittest.mock import MagicMock
@@ -92,14 +91,12 @@ class TestBackendSwitch:
     ) -> None:
         """is_gaussdb_backend importable but crewai.gaussdb.connection not → []."""
         monkeypatch.setenv("CREWAI_STORAGE_BACKEND", "gaussdb")
+        import sys
+
         from crewai_cli import task_outputs as to
 
-        real_import = builtins.__import__
-
-        def fake_import(name, *args, **kwargs):  # type: ignore[no-untyped-def]
-            if name.startswith("crewai.gaussdb.connection"):
-                raise ImportError("No module named 'psycopg2'")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", fake_import)
+        # A None value in sys.modules makes the from-import raise ImportError
+        # ("import halted") even when the module is already cached — narrow,
+        # deterministic, and restored by monkeypatch.
+        monkeypatch.setitem(sys.modules, "crewai.gaussdb.connection", None)
         assert to.load_task_outputs() == []
