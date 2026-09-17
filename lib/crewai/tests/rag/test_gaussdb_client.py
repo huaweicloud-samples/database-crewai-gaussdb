@@ -633,14 +633,28 @@ def _orthogonal_embedding(texts: list[str]) -> list[list[float]]:
     return out
 
 
-def _env_rag_config() -> GaussDBRagConfig:
+def _embedding_1536(texts: list[str]) -> list[list[float]]:
+    """Deterministic 1536-dim vectors keyed on batch position.
+
+    Document and query vectors are allowed to differ: the high-dim chain
+    test asserts row counts and the index type, not exact ranking.
+    """
+    return [
+        [0.01 * j + 0.001 * (k % 5) for j in range(1536)]
+        for k, _ in enumerate(texts)
+    ]
+
+
+def _env_rag_config(
+    embedding_function: Any = _orthogonal_embedding,
+) -> GaussDBRagConfig:
     return GaussDBRagConfig(
         host=os.environ.get("GAUSSDB_HOST", "localhost"),
         port=int(os.environ.get("GAUSSDB_PORT", "5432")),
         user=os.environ.get("GAUSSDB_USER", ""),
         password=os.environ.get("GAUSSDB_PASSWORD", ""),
         database=os.environ.get("GAUSSDB_DATABASE", "crewai"),
-        embedding_function=_orthogonal_embedding,
+        embedding_function=embedding_function,
     )
 
 
@@ -804,4 +818,45 @@ class TestGaussDBClientIntegration:
                 assert cur.fetchall() == []
         finally:
             client.reset()
+            reset_pool()
+
+    def test_high_dim_diskann_end_to_end(self) -> None:
+        """1536 dims through the knowledge chain: add_documents ->
+        auto-selected GsDiskANN+PQ index -> search. Centralized only:
+        distributed instances reject >1024-dim tables (skip per the gate)."""
+        from crewai.gaussdb.connection import cursor as db_cursor, reset_pool
+        from crewai.gaussdb.vector import is_distributed
+
+        with db_cursor(_env_db_config()) as cur:
+            if is_distributed(cur):
+                pytest.skip("distributed instances cap dims at 1024")
+
+        client = GaussDBClient(config=_env_rag_config(_embedding_1536))
+        client.delete_collection(collection_name="hd_test")
+        try:
+            docs: list[BaseRecord] = [
+                {"content": f"hd doc {i}", "metadata": {"kind": "hd"}}
+                for i in range(20)
+            ]
+            client.add_documents(collection_name="hd_test", documents=docs)
+
+            with db_cursor(_env_db_config()) as cur:
+                cur.execute(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE tablename = 'crewai_rag_hd_test' "
+                    "AND lower(indexdef) LIKE '%gsdiskann%'"
+                )
+                defs = [r[0] for r in cur.fetchall()]
+            assert defs, "expected a GSDISKANN index on crewai_rag_hd_test"
+            assert "pq_nseg=96" in defs[0].lower(), defs[0]
+
+            hits = client.search(
+                collection_name="hd_test",
+                query="hd query",
+                limit=3,
+                score_threshold=0.0,
+            )
+            assert len(hits) == 3
+        finally:
+            client.delete_collection(collection_name="hd_test")
             reset_pool()

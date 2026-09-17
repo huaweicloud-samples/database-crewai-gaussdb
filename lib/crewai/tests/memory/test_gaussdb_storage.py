@@ -890,3 +890,49 @@ class TestGaussDBStorageIntegration:
             storage.reset()
         finally:
             reset_pool()
+
+    def test_high_dim_diskann_end_to_end(self) -> None:
+        """1536 dims walk the full chain: save -> auto-selected GsDiskANN+PQ
+        index -> search. Centralized only: distributed instances reject
+        >1024-dim tables at CREATE TABLE, so skip there per the gate."""
+        from crewai.gaussdb.connection import cursor as db_cursor, reset_pool
+        from crewai.gaussdb.vector import is_distributed
+
+        cfg = GaussDBConfig.from_env()
+        with db_cursor(cfg) as cur:
+            if is_distributed(cur):
+                pytest.skip("distributed instances cap dims at 1024")
+            cur.execute("DROP TABLE IF EXISTS memories")
+        try:
+            storage = gs.GaussDBStorage(config=cfg)
+            records = [
+                MemoryRecord(
+                    content=f"mem {i}",
+                    scope="/hd/test",
+                    embedding=[
+                        0.001 * ((i % 7) - 3) + 0.01 * j for j in range(1536)
+                    ],
+                )
+                for i in range(20)
+            ]
+            storage.save(records)  # first insert pins dim 1536 -> DiskANN+PQ
+
+            with db_cursor(cfg) as cur:
+                cur.execute(
+                    "SELECT indexdef FROM pg_indexes WHERE tablename = 'memories' "
+                    "AND lower(indexdef) LIKE '%gsdiskann%'"
+                )
+                defs = [r[0] for r in cur.fetchall()]
+            assert defs, "expected a GSDISKANN index on memories"
+            assert "pq_nseg=96" in defs[0].lower(), defs[0]
+
+            # Search exercises the DiskANN probe GUC branch (_dim=1536 > 1024).
+            hits = storage.search(
+                [0.01 * j for j in range(1536)], scope_prefix="/hd/test", limit=3
+            )
+            assert len(hits) == 3
+            assert hits[0][0].content.startswith("mem ")
+
+            storage.reset()  # cleanup: DROP memories
+        finally:
+            reset_pool()
