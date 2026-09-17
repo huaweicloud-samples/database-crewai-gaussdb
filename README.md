@@ -791,3 +791,50 @@ CheckpointConfig(location="gaussdb", provider=GaussDBProvider())
 - Integration tests: set `GAUSSDB_TEST=1` plus the connection vars and run with
   `pytest -n 0` (serial) — the shared test database does not tolerate parallel
   DDL from multiple xdist workers.
+
+### Vector storage (Memory / Knowledge)
+
+The vector chains (unified Memory and Knowledge/RAG) can run on GaussDB too.
+They reuse the connection setup from above; only the routing differs:
+
+- Memory: `Memory(storage="gaussdb")` — the string is dispatched to the
+  built-in `GaussDBStorage` branch in `crewai.memory.unified_memory`.
+- Knowledge / RAG: assign the global config
+  `crewai.rag.config = GaussDBRagConfig(database="crewai")` (import it from
+  `crewai.rag.gaussdb.config`). `KnowledgeStorage` instances created with an
+  explicit `embedder=` follow the global config type automatically — the
+  embedder is wired into a copy of the global config.
+
+Dimension rules (verified on GaussDB 507):
+
+- Centralized instances accept up to 4096 dims: 1024 and below get a GsIVFFLAT
+  index, anything above gets GsDiskANN+PQ (chosen automatically; `pq_nseg` is
+  derived from the dimension).
+- Distributed instances have a hard CREATE TABLE limit of 1024 dims — use an
+  embedding model with at most 1024 dimensions (e.g. text-embedding-3-small
+  with `dimensions=1024`).
+- Vector search requires `enable_vectordb=on` on the instance. This is a
+  POSTMASTER-level setting: `gs_guc set ... -c "enable_vectordb=on"` followed
+  by a cluster restart.
+
+Behavior notes:
+
+- Memory ranks with `score = clamp(1 - cosine_distance, 0, 1)` (matching the
+  Qdrant backend); scope filtering uses an indexed prefix `LIKE`. Changing the
+  embedding model after data exists raises `EmbeddingDimensionMismatchError` —
+  reset the memory store to rebuild it.
+- Knowledge replicates the ChromaDB backend's conventions, so
+  `score_threshold` behaves the same: document IDs default to
+  `sha256(content + "|" + json.dumps(metadata, sort_keys=True))` and
+  `score = clamp(1 - 0.5 * distance, 0, 1)`; `limit` and `batch_size` come
+  from the config object.
+- The database password is excluded from serialization (same contract as the
+  relational backend above).
+- Vector columns are NOT NULL, and the embedding dimension is fixed when the
+  table is first created (derived from the first embedding).
+
+### Test convention
+
+GaussDB integration tests are gated on `GAUSSDB_TEST=1` plus the `GAUSSDB_*`
+connection variables and must run serially: `pytest -n 0` (parallel xdist
+workers race shared-database DDL).
