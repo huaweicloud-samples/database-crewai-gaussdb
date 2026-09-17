@@ -24,8 +24,7 @@ GaussDB-specific facts (verified on GaussDB 507 O-mode):
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
+from contextlib import AbstractContextManager, nullcontext
 import hashlib
 import json
 import re
@@ -60,8 +59,6 @@ if TYPE_CHECKING:
 _TABLE_PREFIX = "crewai_rag_"
 # GaussDB (like PostgreSQL) caps identifiers at 63 bytes.
 _MAX_IDENTIFIER = 63
-_DEFAULT_BATCH_SIZE = 100
-_DEFAULT_LIMIT = 10
 _DIM_PROBE_TEXT = "__dim__"
 
 
@@ -87,6 +84,13 @@ def _json_scalar_text(value: Any) -> str:
 
     ``->>`` returns the JSON scalar as text: booleans are ``true``/``false``
     (not Python's ``True``), numbers/strings use their JSON text form.
+
+    Known mismatch: floats whose Python ``str()`` form differs from the jsonb
+    numeric text — jsonb stores numbers as ``numeric`` and ``->>`` expands
+    them fully, while ``str()`` uses scientific notation for magnitudes
+    >= 1e16 or < 1e-4 (e.g. ``str(1e30)`` is ``"1e+30"`` but the stored jsonb
+    text is ``"1000...0"``) — silently never match. Filter such keys with
+    pre-normalized strings instead.
     """
 
     if isinstance(value, bool):
@@ -133,6 +137,11 @@ class GaussDBClient(BaseClient):
             max_connections=cfg.max_connections,
         )
         self.client: Any = None
+        # Config-driven search/batch defaults (BaseRagConfig fields, as the
+        # chromadb/qdrant backends wire them). score_threshold is NOT wired:
+        # filtering happens only when explicitly passed (see search).
+        self._limit = cfg.limit
+        self._batch_size = cfg.batch_size
         self._lock_name = f"gaussdb:{cfg.host}:{cfg.port}:{cfg.database}:rag"
 
     # ---- helpers ----
@@ -148,21 +157,6 @@ class GaussDBClient(BaseClient):
 
         return store_lock(self._lock_name) if self._lock_name else nullcontext()
 
-    @asynccontextmanager
-    async def _alocked(self) -> AsyncIterator[None]:
-        """Async cross-process lock that acquires/releases in an executor."""
-
-        if not self._lock_name:
-            yield
-            return
-        lock_cm = store_lock(self._lock_name)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lock_cm.__enter__)
-        try:
-            yield
-        finally:
-            await loop.run_in_executor(None, lock_cm.__exit__, None, None, None)
-
     def _require_embedding_function(self) -> Any:
         if self.embedding_function is None:
             raise ValueError(
@@ -171,6 +165,12 @@ class GaussDBClient(BaseClient):
                 "no local default embedder is bundled for the GaussDB backend."
             )
         return self.embedding_function
+
+    def _embedding_dim(self) -> int:
+        """Probe the embedding dimension with a single text (remote I/O)."""
+
+        embedding_function = self._require_embedding_function()
+        return len(embedding_function([_DIM_PROBE_TEXT])[0])
 
     @staticmethod
     def _table_exists(cur: Psycopg2Cursor, table: str) -> bool:
@@ -201,11 +201,11 @@ class GaussDBClient(BaseClient):
         row = cur.fetchone()
         return int(row[0]) if row and row[0] is not None else None
 
-    def _create_collection_table(self, cur: Psycopg2Cursor, table: str) -> int:
+    def _create_collection_table(
+        self, cur: Psycopg2Cursor, table: str, dim: int
+    ) -> None:
         """Create the table, dimension COMMENT and vector index (lock held)."""
 
-        embedding_function = self._require_embedding_function()
-        dim = len(embedding_function([_DIM_PROBE_TEXT])[0])
         validate_dimension(dim, is_distributed(cur))
         cur.execute(
             f"CREATE TABLE IF NOT EXISTS {table} ("
@@ -218,20 +218,24 @@ class GaussDBClient(BaseClient):
         ensure_vector_index(
             cur, f"idx_{table}"[:_MAX_IDENTIFIER], table, "embedding", dim
         )
-        return dim
 
-    def _ensure_collection(self, cur: Psycopg2Cursor, table: str) -> int | None:
-        """Create the table when missing (lock held); return the stored dim."""
+    def _ensure_collection(self, cur: Psycopg2Cursor, table: str, dim: int) -> None:
+        """Create the table when missing, else verify the stored dimension.
+
+        Lock held by the caller. A dimension mismatch raises ValueError here
+        so callers fail before writing any rows.
+        """
 
         if not self._table_exists(cur, table):
-            return self._create_collection_table(cur, table)
-        return self._read_embedding_dim(cur, table)
+            self._create_collection_table(cur, table, dim)
+            return
+        self._validate_dim(self._read_embedding_dim(cur, table), dim, table)
 
     @staticmethod
-    def _validate_dim(stored_dim: int | None, vector: list[float], table: str) -> None:
-        if stored_dim is not None and len(vector) != stored_dim:
+    def _validate_dim(stored_dim: int | None, dim: int, table: str) -> None:
+        if stored_dim is not None and dim != stored_dim:
             raise ValueError(
-                f"Embedding dimension {len(vector)} does not match the stored "
+                f"Embedding dimension {dim} does not match the stored "
                 f"dimension {stored_dim} of table '{table}'. Use an embedding "
                 f"function consistent with the one used to create the collection."
             )
@@ -297,13 +301,14 @@ class GaussDBClient(BaseClient):
         """
 
         table = self._table_name(kwargs["collection_name"])
+        dim = self._embedding_dim()  # remote I/O kept outside the schema lock
         with self._locked(), cursor(self._config) as cur:
             if self._table_exists(cur, table):
                 raise ValueError(
                     f"Collection '{kwargs['collection_name']}' already exists "
                     f"(table {table})"
                 )
-            self._create_collection_table(cur, table)
+            self._create_collection_table(cur, table, dim)
 
     async def acreate_collection(self, **kwargs: Unpack[BaseCollectionParams]) -> None:
         """Create a new collection in GaussDB asynchronously.
@@ -333,7 +338,9 @@ class GaussDBClient(BaseClient):
         table = self._table_name(kwargs["collection_name"])
         with self._locked(), cursor(self._config) as cur:
             if not self._table_exists(cur, table):
-                self._create_collection_table(cur, table)
+                # Rare create path: a single probe embedding during DDL is
+                # acceptable; the hot add/search paths never probe here.
+                self._create_collection_table(cur, table, self._embedding_dim())
         return table
 
     async def aget_or_create_collection(
@@ -355,50 +362,70 @@ class GaussDBClient(BaseClient):
 
         Performs an upsert — documents with an existing doc_id are updated.
         Embeddings are generated with the configured embedding function in
-        batches (default 100). The collection is created implicitly when
-        missing (chromadb get_or_create parity).
+        batches (default: ``batch_size`` config, 100), OUTSIDE the schema
+        lock and outside any transaction; each batch then commits in its own
+        short transaction (chromadb also writes per batch, and upsert
+        idempotency makes a re-run safe). The collection is created
+        implicitly when missing (chromadb get_or_create parity).
 
         Keyword Args:
             collection_name: The name of the collection to add documents to.
             documents: List of BaseRecord dicts containing ``content``
                 (required), optional ``doc_id`` (auto-hashed when missing)
                 and optional ``metadata``.
-            batch_size: Batch size for the MERGE statements (default 100).
+            batch_size: Batch size for the MERGE statements (default: the
+                ``batch_size`` config field).
 
         Raises:
             ValueError: If documents is empty, no embedding function is
-                configured, or an embedding dimension mismatches the table.
+                configured, or an embedding dimension mismatches the table
+                (raised before any rows are written).
             ConnectionError: If unable to connect to GaussDB.
         """
 
         documents = kwargs["documents"]
-        batch_size = kwargs.get("batch_size", _DEFAULT_BATCH_SIZE)
+        batch_size = kwargs.get("batch_size") or self._batch_size
 
         if not documents:
             raise ValueError("Documents list cannot be empty")
         embedding_function = self._require_embedding_function()
 
         table = self._table_name(kwargs["collection_name"])
-        prepared = self._prepare_documents(documents)
+        normalized = self._prepare_documents(documents)
 
+        # Embed in batches outside the schema lock and any transaction: the
+        # embedding call is remote I/O and must not pin the pooled
+        # connection or hold the cross-process lock. The first batch doubles
+        # as the dimension probe.
+        batches = [
+            normalized[i : i + batch_size]
+            for i in range(0, len(normalized), batch_size)
+        ]
+        batch_vectors = [
+            embedding_function([content for _, content, _ in batch])
+            for batch in batches
+        ]
+        probe_dim = len(batch_vectors[0][0])
+
+        # The lock covers only the schema check/creation (pure DDL); a
+        # dimension mismatch raises here, before any rows are written.
         with self._locked(), cursor(self._config) as cur:
-            stored_dim = self._ensure_collection(cur, table)
-            for start in range(0, len(prepared), batch_size):
-                batch = prepared[start : start + batch_size]
-                vectors = embedding_function([content for _, content, _ in batch])
-                rows = []
+            self._ensure_collection(cur, table, probe_dim)
+
+        for batch, vectors in zip(batches, batch_vectors, strict=True):
+            rows = [
+                {
+                    "id": doc_id,
+                    "content": content,
+                    "metadata": json.dumps(metadata, ensure_ascii=False),
+                    "embedding": vector,
+                }
                 for (doc_id, content, metadata), vector in zip(
                     batch, vectors, strict=True
-                ):
-                    self._validate_dim(stored_dim, vector, table)
-                    rows.append(
-                        {
-                            "id": doc_id,
-                            "content": content,
-                            "metadata": json.dumps(metadata, ensure_ascii=False),
-                            "embedding": vector,
-                        }
-                    )
+                )
+            ]
+            # One short transaction per batch, outside the lock.
+            with cursor(self._config) as cur:
                 upsert_via_merge(
                     cur,
                     table,
@@ -414,7 +441,8 @@ class GaussDBClient(BaseClient):
         Keyword Args:
             collection_name: The name of the collection to add documents to.
             documents: List of BaseRecord dicts (see :meth:`add_documents`).
-            batch_size: Batch size for the MERGE statements (default 100).
+            batch_size: Batch size for the MERGE statements (default: the
+                ``batch_size`` config field).
         """
 
         await asyncio.to_thread(self.add_documents, **kwargs)
@@ -427,7 +455,8 @@ class GaussDBClient(BaseClient):
         Keyword Args:
             collection_name: The name of the collection to search in.
             query: The text query to search for.
-            limit: Maximum number of results to return (default 10).
+            limit: Maximum number of results to return (default: the
+                ``limit`` config field).
             metadata_filter: Optional dict of metadata equality filters
                 (multi-key AND, values fully parameterized). Values are
                 matched against the jsonb text form (booleans as
@@ -446,22 +475,31 @@ class GaussDBClient(BaseClient):
         """
 
         query = kwargs["query"]
-        limit = kwargs.get("limit", _DEFAULT_LIMIT)
+        limit = kwargs.get("limit") or self._limit
         metadata_filter = kwargs.get("metadata_filter")
         score_threshold = kwargs.get("score_threshold")
         embedding_function = self._require_embedding_function()
 
         table = self._table_name(kwargs["collection_name"])
+        query_vector = embedding_function([query])[0]  # remote I/O, outside the tx
         with cursor(self._config) as cur:
             if not self._table_exists(cur, table):
                 raise ValueError(
                     f"Collection '{kwargs['collection_name']}' does not exist "
                     f"(table {table})"
                 )
-            query_vector = embedding_function([query])[0]
-            self._validate_dim(
-                self._read_embedding_dim(cur, table), query_vector, table
-            )
+            dim = self._read_embedding_dim(cur, table)
+            self._validate_dim(dim, len(query_vector), table)
+            # Set the probe GUCs for this session (same values as
+            # ensure_vector_index): pooled recall-only processes never run
+            # ensure_vector_index, so without this they search with default
+            # probes and recall quality silently degrades. Unknown dim
+            # (comment-less empty table) — skip; the default probes are
+            # functionally correct, just less thorough.
+            if dim is not None and dim > 1024:
+                cur.execute("SET diskann_probe_ncandidates = 200")
+            elif dim is not None:
+                cur.execute("SET gsivfflat_probes = 25")
 
             sql = (
                 f"SELECT id, content, metadata, embedding <+> %s AS distance "  # noqa: S608
@@ -505,7 +543,8 @@ class GaussDBClient(BaseClient):
         Keyword Args:
             collection_name: The name of the collection to search in.
             query: The text query to search for.
-            limit: Maximum number of results to return (default 10).
+            limit: Maximum number of results to return (default: the
+                ``limit`` config field).
             metadata_filter: Optional metadata equality filter.
             score_threshold: Optional minimum similarity score (0-1).
 

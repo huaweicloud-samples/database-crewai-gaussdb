@@ -377,6 +377,73 @@ class TestSearch:
         with pytest.raises(ValueError, match="embedding_function"):
             client.search(collection_name="docs", query="q")
 
+    def test_sets_ivfflat_probes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Recall-only sessions must set the probe GUCs themselves (memory parity)."""
+
+        fake = FakeCursor(
+            fetchone_map={"pg_tables": (1,), "col_description": ("dim=8",)},
+            fetchall_map={"embedding <+>": []},
+        )
+        client = _make_client(fake, monkeypatch)
+        client.search(collection_name="docs", query="q")
+        assert any("SET gsivfflat_probes = 25" in sql for sql, _ in fake.executed)
+
+    def test_sets_diskann_probes_above_1024(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeCursor(
+            fetchone_map={"pg_tables": (1,), "col_description": ("dim=2048",)},
+            fetchall_map={"embedding <+>": []},
+        )
+        client = _make_client(
+            fake, monkeypatch, embedding_function=lambda texts: [[0.1] * 2048 for _ in texts]
+        )
+        client.search(collection_name="docs", query="q")
+        assert any(
+            "SET diskann_probe_ncandidates = 200" in sql for sql, _ in fake.executed
+        )
+        assert not any("gsivfflat_probes" in sql for sql, _ in fake.executed)
+
+
+class TestConfigDrivenDefaults:
+    """kwargs override the config fields (limit / batch_size)."""
+
+    def test_config_limit_used_when_kwarg_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeCursor(
+            fetchone_map={"pg_tables": (1,)},
+            fetchall_map={"embedding <+>": []},
+        )
+        client = _make_client(fake, monkeypatch, limit=7)
+        client.search(collection_name="docs", query="q")
+        _, params = next(
+            (sql, p) for sql, p in fake.executed if "embedding <+>" in sql
+        )
+        assert params[-1] == 7
+
+    def test_kwarg_limit_wins_over_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakeCursor(
+            fetchone_map={"pg_tables": (1,)},
+            fetchall_map={"embedding <+>": []},
+        )
+        client = _make_client(fake, monkeypatch, limit=7)
+        client.search(collection_name="docs", query="q", limit=2)
+        _, params = next(
+            (sql, p) for sql, p in fake.executed if "embedding <+>" in sql
+        )
+        assert params[-1] == 2
+
+    def test_config_batch_size_splits_batches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeCursor(fetchone_map={"pg_tables": (1,)})
+        client = _make_client(fake, monkeypatch, batch_size=3)
+        docs: list[BaseRecord] = [{"content": f"c{i}"} for i in range(5)]
+        client.add_documents(collection_name="docs", documents=docs)
+        payloads = _merge_payloads(fake)
+        assert [len(p) for p in payloads] == [3, 2]
+
 
 # ---- collection lifecycle ----
 
