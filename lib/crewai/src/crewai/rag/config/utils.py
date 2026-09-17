@@ -59,6 +59,23 @@ def get_rag_config() -> RagConfigType:
     return context.config
 
 
+def peek_rag_config() -> RagConfigType | None:
+    """Get the current RAG configuration without materializing defaults.
+
+    Unlike :func:`get_rag_config`, this returns ``None`` when no global
+    config has been set, instead of instantiating the default configuration
+    (which also creates its client) — for call sites that must inspect the
+    active provider without mutating global state.
+
+    Returns:
+        The current RAG configuration object, or None when unset.
+    """
+    context = _rag_context.get()
+    if context is None:
+        return None
+    return context.config
+
+
 def get_rag_client() -> BaseClient:
     """Get the current RAG client instance.
 

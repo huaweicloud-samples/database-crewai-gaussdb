@@ -1,3 +1,5 @@
+from collections.abc import Callable
+import dataclasses
 import logging
 import traceback
 from typing import Any, cast
@@ -9,12 +11,13 @@ from typing_extensions import Self
 from crewai.knowledge.storage.base_knowledge_storage import BaseKnowledgeStorage
 from crewai.rag.chromadb.config import ChromaDBConfig
 from crewai.rag.chromadb.types import ChromaEmbeddingFunctionWrapper
-from crewai.rag.config.utils import get_rag_client
+from crewai.rag.config.utils import get_rag_client, peek_rag_config
 from crewai.rag.core.base_client import BaseClient
 from crewai.rag.core.base_embeddings_provider import BaseEmbeddingsProvider
 from crewai.rag.embeddings.factory import build_embedder
 from crewai.rag.embeddings.types import ProviderSpec
 from crewai.rag.factory import create_client
+from crewai.rag.gaussdb.config import GaussDBRagConfig
 from crewai.rag.types import BaseRecord, SearchResult
 from crewai.utilities.logger import Logger
 
@@ -44,11 +47,25 @@ class KnowledgeStorage(BaseKnowledgeStorage):
 
         if self.embedder:
             embedding_function = build_embedder(self.embedder)  # type: ignore[arg-type]
-            config = ChromaDBConfig(
-                embedding_function=cast(
-                    ChromaEmbeddingFunctionWrapper, embedding_function
+            global_config = peek_rag_config()
+            if isinstance(global_config, GaussDBRagConfig):
+                # The GaussDB backend has no default embedder, so the instance
+                # embedder must be wired into the global config; connection
+                # settings are preserved. peek_rag_config (not get_rag_config)
+                # keeps the unset/default path free of side effects.
+                config: ChromaDBConfig | GaussDBRagConfig = dataclasses.replace(
+                    global_config,
+                    embedding_function=cast(
+                        Callable[[list[str]], list[list[float]]],
+                        embedding_function,
+                    ),
                 )
-            )
+            else:
+                config = ChromaDBConfig(
+                    embedding_function=cast(
+                        ChromaEmbeddingFunctionWrapper, embedding_function
+                    )
+                )
             self._client = create_client(config)
         return self
 
